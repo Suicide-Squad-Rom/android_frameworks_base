@@ -19,10 +19,15 @@ package com.android.systemui.statusbar.phone;
 import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.content.res.Resources;
+import android.graphics.Point;
 import android.graphics.PixelFormat;
 import android.os.SystemProperties;
+import android.os.UserHandle;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Gravity;
+import android.view.Display;
+import android.view.SurfaceSession;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -30,9 +35,11 @@ import android.view.WindowManager;
 import com.android.keyguard.R;
 import com.android.systemui.keyguard.KeyguardViewMediator;
 import com.android.systemui.statusbar.BaseStatusBar;
-import com.android.systemui.statusbar.RemoteInputController;
 import com.android.systemui.statusbar.StatusBarState;
+import com.android.systemui.statusbar.policy.KeyguardMonitor;
+import com.android.systemui.statusbar.policy.LiveLockScreenController;
 import cyanogenmod.providers.CMSettings;
+import org.cyanogenmod.internal.util.CmLockPatternUtils;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
@@ -41,7 +48,7 @@ import java.lang.reflect.Field;
 /**
  * Encapsulates all logic for the status bar window state management.
  */
-public class StatusBarWindowManager implements RemoteInputController.Callback {
+public class StatusBarWindowManager implements KeyguardMonitor.Callback {
 
     private final Context mContext;
     private final WindowManager mWindowManager;
@@ -49,27 +56,56 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
     private WindowManager.LayoutParams mLp;
     private WindowManager.LayoutParams mLpChanged;
     private int mBarHeight;
-    private boolean mKeyguardScreenRotation;
     private final float mScreenBrightnessDoze;
-    private final State mCurrentState = new State();
 
-    public StatusBarWindowManager(Context context) {
+    private boolean mKeyguardBlurEnabled;
+    private boolean mShowingMedia;
+    private BlurLayer mKeyguardBlur;
+    private final SurfaceSession mFxSession;
+
+    private final KeyguardMonitor mKeyguardMonitor;
+
+    private static final int TYPE_LAYER_MULTIPLIER = 10000; // refer to WindowManagerService.TYPE_LAYER_MULTIPLIER
+    private static final int TYPE_LAYER_OFFSET = 1000;      // refer to WindowManagerService.TYPE_LAYER_OFFSET
+
+    private static final int STATUS_BAR_LAYER = 16 * TYPE_LAYER_MULTIPLIER + TYPE_LAYER_OFFSET;
+
+    private boolean mKeyguardScreenRotation;
+
+    private final State mCurrentState = new State();
+    private LiveLockScreenController mLiveLockScreenController;
+
+    public StatusBarWindowManager(Context context, KeyguardMonitor kgm) {
         mContext = context;
         mWindowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
         mKeyguardScreenRotation = shouldEnableKeyguardScreenRotation();
         mScreenBrightnessDoze = mContext.getResources().getInteger(
                 com.android.internal.R.integer.config_screenBrightnessDoze) / 255f;
+
+        mKeyguardMonitor = kgm;
+        mKeyguardMonitor.addCallback(this);
+        mKeyguardBlurEnabled = mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_ui_blur_enabled);
+        mFxSession = new SurfaceSession();
     }
 
     private boolean shouldEnableKeyguardScreenRotation() {
         Resources res = mContext.getResources();
-        boolean enableAccelerometerRotation = Settings.System.getInt(mContext.getContentResolver(),
-                Settings.System.ACCELEROMETER_ROTATION, 1) != 0;
-        boolean enableLockScreenRotation = CMSettings.System.getInt(mContext.getContentResolver(),
-                CMSettings.System.LOCKSCREEN_ROTATION, 0) != 0;
-        return SystemProperties.getBoolean("lockscreen.rot_override", false)
-                || (res.getBoolean(R.bool.config_enableLockScreenRotation)
-                && (enableLockScreenRotation && enableAccelerometerRotation));
+        final boolean configLockRotationValue =
+                res.getBoolean(R.bool.config_enableLockScreenRotation);
+        boolean enableLockScreenRotation = Settings.System.getIntForUser(
+                mContext.getContentResolver(), Settings.System.LOCKSCREEN_ROTATION,
+                configLockRotationValue ? 1 : 0, UserHandle.USER_CURRENT) != 0;
+        boolean enableAccelerometerRotation = Settings.System.getIntForUser(
+                mContext.getContentResolver(), Settings.System.ACCELEROMETER_ROTATION, 0,
+                UserHandle.USER_CURRENT) != 0;
+
+        return SystemProperties.getBoolean("lockscreen.rot_override",false)
+               || (enableLockScreenRotation && enableAccelerometerRotation);
+    }
+
+    public void updateKeyguardScreenRotation() {
+        mKeyguardScreenRotation = shouldEnableKeyguardScreenRotation();
     }
 
     /**
@@ -79,7 +115,6 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
      * @param barHeight The height of the status bar in collapsed state.
      */
     public void add(View statusBarView, int barHeight) {
-
         // Now that the status bar window encompasses the sliding panel and its
         // translucent backdrop, the entire thing is made TRANSLUCENT and is
         // hardware-accelerated.
@@ -104,21 +139,29 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         mLpChanged = new WindowManager.LayoutParams();
         mLpChanged.copyFrom(mLp);
 
-        SettingsObserver observer = new SettingsObserver(new Handler());
-        observer.observe(mContext);
+        if (mKeyguardBlurEnabled) {
+            Display display = mWindowManager.getDefaultDisplay();
+            Point xy = new Point();
+            display.getRealSize(xy);
+            mKeyguardBlur = new BlurLayer(mFxSession, xy.x, xy.y, "KeyGuard");
+            if (mKeyguardBlur != null) {
+                mKeyguardBlur.setLayer(STATUS_BAR_LAYER - 2);
+            }
+        }
     }
 
     private void applyKeyguardFlags(State state) {
         if (state.keyguardShowing) {
             mLpChanged.privateFlags |= WindowManager.LayoutParams.PRIVATE_FLAG_KEYGUARD;
-        } else {
-            mLpChanged.privateFlags &= ~WindowManager.LayoutParams.PRIVATE_FLAG_KEYGUARD;
-        }
-
-        if (state.keyguardShowing && !state.backdropShowing) {
-            mLpChanged.flags |= WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER;
+            if (!mKeyguardBlurEnabled || mShowingMedia) {
+                mLpChanged.flags |= WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER;
+            }
         } else {
             mLpChanged.flags &= ~WindowManager.LayoutParams.FLAG_SHOW_WALLPAPER;
+            mLpChanged.privateFlags &= ~WindowManager.LayoutParams.PRIVATE_FLAG_KEYGUARD;
+            if (mKeyguardBlurEnabled && mKeyguardBlur != null) {
+                mKeyguardBlur.hide();
+            }
         }
     }
 
@@ -136,8 +179,7 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
 
     private void applyFocusableFlag(State state) {
         boolean panelFocusable = state.statusBarFocusable && state.panelExpanded;
-        if (state.keyguardShowing && state.keyguardNeedsInput && state.bouncerShowing
-                || BaseStatusBar.ENABLE_REMOTE_INPUT && state.remoteInputActive) {
+        if (state.keyguardShowing && state.keyguardNeedsInput && state.bouncerShowing) {
             mLpChanged.flags &= ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
             mLpChanged.flags &= ~WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM;
         } else if (state.isKeyguardShowingAndNotOccluded() || panelFocusable) {
@@ -147,8 +189,6 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
             mLpChanged.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
             mLpChanged.flags &= ~WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM;
         }
-
-        mLpChanged.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
     }
 
     private void applyHeight(State state) {
@@ -183,7 +223,7 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
     private void applyInputFeatures(State state) {
         if (state.isKeyguardShowingAndNotOccluded()
                 && state.statusBarState == StatusBarState.KEYGUARD
-                && !state.qsExpanded && !state.forceUserActivity) {
+                && !state.qsExpanded) {
             mLpChanged.inputFeatures |=
                     WindowManager.LayoutParams.INPUT_FEATURE_DISABLE_USER_ACTIVITY;
         } else {
@@ -234,13 +274,34 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         }
     }
 
+    private void applyKeyguardBlurShow(){
+        boolean isblur = false;
+        if (mCurrentState.keyguardShowing && mKeyguardBlurEnabled
+                && !mCurrentState.keyguardOccluded
+                && !mShowingMedia
+                && !isShowingLiveLockScreen()) {
+            isblur = true;
+        }
+        if (mKeyguardBlur != null) {
+            if (isblur) {
+                mKeyguardBlur.show();
+            } else {
+                mKeyguardBlur.hide();
+            }
+        }
+    }
+
     public void setKeyguardShowing(boolean showing) {
         mCurrentState.keyguardShowing = showing;
         apply(mCurrentState);
     }
 
     public void setKeyguardOccluded(boolean occluded) {
+        final boolean oldOccluded = mCurrentState.keyguardOccluded;
         mCurrentState.keyguardOccluded = occluded;
+        if (oldOccluded != occluded) {
+            applyKeyguardBlurShow();
+        }
         apply(mCurrentState);
     }
 
@@ -265,11 +326,6 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         apply(mCurrentState);
     }
 
-    public void setBackdropShowing(boolean showing) {
-        mCurrentState.backdropShowing = showing;
-        apply(mCurrentState);
-    }
-
     public void setKeyguardFadingAway(boolean keyguardFadingAway) {
         mCurrentState.keyguardFadingAway = keyguardFadingAway;
         apply(mCurrentState);
@@ -280,14 +336,32 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         apply(mCurrentState);
     }
 
-    public void setForceUserActivity(boolean forceUserActivity) {
-        mCurrentState.forceUserActivity = forceUserActivity;
-        apply(mCurrentState);
-    }
-
     public void setHeadsUpShowing(boolean showing) {
         mCurrentState.headsUpShowing = showing;
         apply(mCurrentState);
+    }
+
+    void setBlur(float b){
+        if (mKeyguardBlurEnabled && mKeyguardBlur != null) {
+            float minBlur = mKeyguardMonitor.isSecure() ? 1.0f : 0.0f;
+            if (b < minBlur) {
+                b = minBlur;
+            } else if (b > 1.0f) {
+                b = 1.0f;
+            }
+            mKeyguardBlur.setBlur(b);
+        }
+    }
+
+    public void setShowingMedia(boolean showingMedia) {
+        mShowingMedia = showingMedia;
+        applyKeyguardBlurShow();
+    }
+
+    public void setKeyguardExternalViewFocus(boolean hasFocus) {
+        mLiveLockScreenController.onLiveLockScreenFocusChanged(hasFocus);
+        // make the keyguard occluded so the external view gets full focus
+        setKeyguardOccluded(hasFocus);
     }
 
     /**
@@ -318,12 +392,6 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         apply(mCurrentState);
     }
 
-    @Override
-    public void onRemoteInputActive(boolean remoteInputActive) {
-        mCurrentState.remoteInputActive = remoteInputActive;
-        apply(mCurrentState);
-    }
-
     /**
      * Set whether the screen brightness is forced to the value we use for doze mode by the status
      * bar window.
@@ -333,9 +401,9 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         apply(mCurrentState);
     }
 
-    public void setBarHeight(int barHeight) {
-        mBarHeight = barHeight;
-        apply(mCurrentState);
+    @Override
+    public void onKeyguardChanged() {
+        applyKeyguardBlurShow();
     }
 
     public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
@@ -343,8 +411,19 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         pw.println(mCurrentState);
     }
 
-    public boolean isShowingWallpaper() {
-        return !mCurrentState.backdropShowing;
+    public boolean keyguardExternalViewHasFocus() {
+        return mLiveLockScreenController.getLiveLockScreenHasFocus();
+    }
+
+    public void setLiveLockscreenController(LiveLockScreenController liveLockScreenController) {
+        mLiveLockScreenController = liveLockScreenController;
+    }
+
+    private boolean isShowingLiveLockScreen() {
+        CmLockPatternUtils lockPatternUtils = new CmLockPatternUtils(mContext);
+        return (CMSettings.Secure.getInt(mContext.getContentResolver(),
+                CMSettings.Secure.LIVE_LOCK_SCREEN_ENABLED, 0) == 1)
+                && lockPatternUtils.isThirdPartyKeyguardEnabled();
     }
 
     private static class State {
@@ -361,15 +440,11 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
         boolean forceStatusBarVisible;
         boolean forceCollapsed;
         boolean forceDozeBrightness;
-        boolean forceUserActivity;
-        boolean backdropShowing;
 
         /**
          * The {@link BaseStatusBar} state from the status bar.
          */
         int statusBarState;
-
-        boolean remoteInputActive;
 
         private boolean isKeyguardShowingAndNotOccluded() {
             return keyguardShowing && !keyguardOccluded;
@@ -399,34 +474,6 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
             result.append("}");
 
             return result.toString();
-        }
-    }
-
-    private class SettingsObserver extends ContentObserver {
-        public SettingsObserver(Handler handler) {
-            super(handler);
-        }
-
-        public void observe(Context context) {
-            context.getContentResolver().registerContentObserver(
-                    Settings.System.getUriFor(Settings.System.ACCELEROMETER_ROTATION),
-                    false,
-                    this);
-            context.getContentResolver().registerContentObserver(
-                    CMSettings.System.getUriFor(CMSettings.System.LOCKSCREEN_ROTATION),
-                    false,
-                    this);
-        }
-
-        public void unobserve(Context context) {
-            context.getContentResolver().unregisterContentObserver(this);
-        }
-
-        @Override
-        public void onChange(boolean selfChange) {
-            mKeyguardScreenRotation = shouldEnableKeyguardScreenRotation();
-            // update the state
-            apply(mCurrentState);
         }
     }
 }
