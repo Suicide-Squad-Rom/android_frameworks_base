@@ -401,33 +401,5 @@ public class StatusBarWindowManager implements RemoteInputController.Callback {
 
             return result.toString();
         }
-    }
-
-    private class SettingsObserver extends ContentObserver {
-        public SettingsObserver(Handler handler) {
-            super(handler);
-        }
-
-        public void observe(Context context) {
-            context.getContentResolver().registerContentObserver(
-                    Settings.System.getUriFor(Settings.System.ACCELEROMETER_ROTATION),
-                    false,
-                    this);
-            context.getContentResolver().registerContentObserver(
-                    CMSettings.System.getUriFor(CMSettings.System.LOCKSCREEN_ROTATION),
-                    false,
-                    this);
-        }
-
-        public void unobserve(Context context) {
-            context.getContentResolver().unregisterContentObserver(this);
-        }
-
-        @Override
-        public void onChange(boolean selfChange) {
-            mKeyguardScreenRotation = shouldEnableKeyguardScreenRotation();
-            // update the state
-            apply(mCurrentState);
-        }
-    }
+    }  
 }
